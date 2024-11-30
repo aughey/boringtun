@@ -41,8 +41,23 @@ const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
 
+/// TunnResult now does not parse data into a V4 or V6 address.  Do to that,
+/// use TunnResultIP::from to do that conversion.
 #[derive(Debug)]
 pub enum TunnResult<'a> {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(&'a mut [u8]),
+    ValidData(&'a mut [u8]),
+}
+
+impl<'a> From<WireGuardError> for TunnResult<'a> {
+    fn from(err: WireGuardError) -> TunnResult<'a> {
+        TunnResult::Err(err)
+    }
+}
+
+pub enum TunnResultIP<'a> {
     Done,
     Err(WireGuardError),
     WriteToNetwork(&'a mut [u8]),
@@ -50,9 +65,20 @@ pub enum TunnResult<'a> {
     WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
 }
 
-impl<'a> From<WireGuardError> for TunnResult<'a> {
-    fn from(err: WireGuardError) -> TunnResult<'a> {
-        TunnResult::Err(err)
+impl<'a> From<WireGuardError> for TunnResultIP<'a> {
+    fn from(err: WireGuardError) -> TunnResultIP<'a> {
+        TunnResultIP::Err(err)
+    }
+}
+
+impl<'a> From<TunnResult<'a>> for TunnResultIP<'a> {
+    fn from(result: TunnResult<'a>) -> TunnResultIP<'a> {
+        match result {
+            TunnResult::Done => TunnResultIP::Done,
+            TunnResult::Err(e) => TunnResultIP::Err(e),
+            TunnResult::WriteToNetwork(p) => TunnResultIP::WriteToNetwork(p),
+            TunnResult::ValidData(d) => Tunn::validate_decapsulated_packet(d),
+        }
     }
 }
 
@@ -425,7 +451,15 @@ impl Tunn {
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
-        Ok(self.validate_decapsulated_packet(decapsulated_packet))
+        self.timer_tick(TimerName::TimeLastDataPacketReceived);
+        self.rx_bytes += decapsulated_packet.len();
+
+        if decapsulated_packet.is_empty() {
+            Ok(TunnResult::Done)
+        } else {
+            Ok(TunnResult::ValidData(decapsulated_packet))
+        }
+        //        Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
@@ -461,9 +495,9 @@ impl Tunn {
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn validate_decapsulated_packet<'a>(packet: &'a mut [u8]) -> TunnResultIP<'a> {
         let (computed_len, src_ip_address) = match packet.len() {
-            0 => return TunnResult::Done, // This is keepalive, and not an error
+            0 => return TunnResultIP::Done, // This is keepalive, and not an error
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
                     .try_into()
@@ -490,19 +524,16 @@ impl Tunn {
                     IpAddr::from(addr_bytes),
                 )
             }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+            _ => return TunnResultIP::Err(WireGuardError::InvalidPacket),
         };
 
         if computed_len > packet.len() {
-            return TunnResult::Err(WireGuardError::InvalidPacket);
+            return TunnResultIP::Err(WireGuardError::InvalidPacket);
         }
 
-        self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        self.rx_bytes += computed_len;
-
         match src_ip_address {
-            IpAddr::V4(addr) => TunnResult::WriteToTunnelV4(&mut packet[..computed_len], addr),
-            IpAddr::V6(addr) => TunnResult::WriteToTunnelV6(&mut packet[..computed_len], addr),
+            IpAddr::V4(addr) => TunnResultIP::WriteToTunnelV4(&mut packet[..computed_len], addr),
+            IpAddr::V6(addr) => TunnResultIP::WriteToTunnelV6(&mut packet[..computed_len], addr),
         }
     }
 
@@ -653,7 +684,7 @@ mod tests {
     fn parse_keepalive(tun: &mut Tunn, keepalive: &[u8]) {
         let mut dst = vec![0u8; 2048];
         let keepalive = tun.decapsulate(None, keepalive, &mut dst);
-        assert!(matches!(keepalive, TunnResult::Done));
+        assert!(matches!(keepalive, TunnResult::Done), "{:?}", keepalive);
     }
 
     fn create_two_tuns_and_handshake() -> (Tunn, Tunn) {
@@ -783,8 +814,9 @@ mod tests {
         };
 
         let data = their_tun.decapsulate(None, data, &mut their_dst);
-        assert!(matches!(data, TunnResult::WriteToTunnelV4(..)));
-        let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = data {
+        let data = TunnResultIP::from(data);
+        assert!(matches!(data, TunnResultIP::WriteToTunnelV4(..)));
+        let recv_packet_buf = if let TunnResultIP::WriteToTunnelV4(recv, _addr) = data {
             recv
         } else {
             unreachable!();
